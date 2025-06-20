@@ -1,105 +1,78 @@
-// index.js – BAYNEX v2
-const express = require("express");
-const fetch = require("node-fetch");
-const WebSocket = require("ws");
-require("dotenv").config();
+// BAYNEX Phase 3 — Intelligent, Profitable & Risk‑Aware // ─────────────────────────────────────────────────────────── // Features  ▸  /start   /help   /balance //           ▸  /start_trade  /stop //           ▸  /profit  /status  /last_trade //           ▸  /set_risk <maxLoss> <maxTrades> //           ▸  /set_filter on|off (enable/disable strategy filter) // ─────────────────────────────────────────────────────────── //  Strategy (default) //    • Trade on synthetic index R_100 (1‑tick) //    • BUY "CALL" when price is above 20‑EMA and RSI(14) < 70 //    • BUY "PUT"  when price is below 20‑EMA and RSI(14) > 30 //  Risk Manager //    • Max trades / session (default 20) //    • Max session loss  (default –10 USD) //    • Profit target     (default +20 USD) //    • 5‑second cool‑down between any two trades //---------------------------------------------------------------- require("dotenv").config(); const express    = require("express"); const fetch      = require("node-fetch"); const WebSocket  = require("ws"); const ta         = require("technicalindicators"); const Telegram   = require("node-telegram-bot-api");
 
-const app = express();
-app.use(express.json());
+// ── ENV ────────────────────────────────────────────────────── const { TELEGRAM_TOKEN, DERIV_TOKEN, APP_ID, RENDER_EXTERNAL_HOSTNAME, PORT = 3000, } = process.env; if (!TELEGRAM_TOKEN || !DERIV_TOKEN || !APP_ID || !RENDER_EXTERNAL_HOSTNAME) { console.error("❌ Missing env vars"); process.exit(1); }
 
-const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
-const DERIV_TOKEN    = process.env.DERIV_TOKEN;
-const APP_ID         = process.env.APP_ID;
-const PORT           = process.env.PORT || 3000;
+// ── Telegram Bot (webhook) ─────────────────────────────────── const bot = new Telegram(TELEGRAM_TOKEN); const WEBHOOK_URL = https://${RENDER_EXTERNAL_HOSTNAME}/webhook; bot.setWebHook(WEBHOOK_URL) .then(() => console.log("✅ Telegram webhook set =>", WEBHOOK_URL)) .catch(e  => console.log("Webhook already set (ignored)", e.message));
 
-// ────────────────────────────────────────────────────────────────
-// 1)  SET WEBHOOK ON COLD START ONLY
-//    (Render restarts always call this file, but setWebhook runs
-//     once because we await it before starting the server.)
-(async () => {
-  const WEBHOOK_URL = `https://${process.env.RENDER_EXTERNAL_HOSTNAME}/webhook`;
-  await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/setWebhook`, {
-    method : "POST",
-    headers: { "Content-Type": "application/json" },
-    body   : JSON.stringify({ url: WEBHOOK_URL })
-  }).then(r => r.json())
-    .then(j => console.log("Telegram webhook set ▶", j))
-    .catch(e => console.log("Webhook already set (ignoring)", e.message));
-})();
-// ────────────────────────────────────────────────────────────────
+// ── Express for webhook receiver ───────────────────────────── const app = express(); app.use(express.json()); app.post("/webhook", (req,res) => { handleUpdate(req.body); res.sendStatus(200); }); app.listen(PORT,()=>console.log(🚀 BAYNEX listening on ${PORT}));
 
-// 2)  TELEGRAM WEBHOOK HANDLER
-app.post("/webhook", async (req, res) => {
-  const chat_id = req.body.message?.chat?.id;
-  const text    = (req.body.message?.text || "").trim().toLowerCase();
+// ── Session State ──────────────────────────────────────────── let autoTrading      = false; let sessionProfit    = 0; let sessionTrades    = 0; let lastTradeInfo    = null; let lastTradeTime    = 0; let MAX_TRADES       = 20; let MAX_SESSION_LOSS = -10;   // USD let PROFIT_TARGET    = 20;    // USD let FILTER_ENABLED   = true;
 
-  switch (text) {
-    case "/start":
-      await sendTelegram(chat_id, "🤖 B.A.Y.N.E.X is online and smarter than ever. Ready for commands.");
-      break;
+// ── Strategy helpers ───────────────────────────────────────── const emaPeriod = 20; let emaSeries = []; let rsiSeries = [];
 
-    case "/balance":
-      await sendTelegram(chat_id, "📡 Fetching your Deriv balance…");
-      getDerivBalance(chat_id);
-      break;
+function updateIndicators(price){ emaSeries.push(price); rsiSeries.push(price); if (emaSeries.length > emaPeriod) emaSeries.shift(); if (rsiSeries.length > 14)        rsiSeries.shift(); const ema = emaSeries.length>=emaPeriod ? ta.EMA.calculate({period:emaPeriod, values:emaSeries}).slice(-1)[0] : null; const rsi = rsiSeries.length>=14 ? ta.RSI.calculate({period:14, values:rsiSeries}).slice(-1)[0] : null; return { ema, rsi }; }
 
-    case "/help":
-      await sendTelegram(chat_id,
-        "🆘 *BAYNEX Help*\n" +
-        "• /start – wake the bot\n" +
-        "• /balance – show Deriv balance\n" +
-        "• /help – this message", { parse_mode: "Markdown" });
-      break;
+// ── Telegram Command Router ───────────────────────────────── function handleUpdate(upd){ const msg = upd.message; if (!msg || !msg.text) return; const chat = msg.chat.id; const parts = msg.text.trim().split(/\s+/); const cmd = parts[0].toLowerCase(); const arg = parts.slice(1);
 
-    default:
-      await sendTelegram(chat_id, "⚠️ Unrecognised command. Type /help");
-  }
-  res.sendStatus(200);
-});
+switch(cmd){ case "/start":   return sendTG(chat,"🤖 B.A.Y.N.E.X online. Type /help.",true); case "/help":    return help(chat); case "/balance": return balance(chat); case "/start_trade": if(autoTrading) return sendTG(chat,"⚠️ Already trading."); autoTrading = true; sessionProfit=0; sessionTrades=0; sendTG(chat,"📈 Auto‑trading STARTED",true); startTrader(chat); return; case "/stop": autoTrading=false; sendTG(chat,"⏹ Trading STOPPED",true); return; case "/profit":  return sendTG(chat,💰 Session profit: *${sessionProfit.toFixed(2)} USD*,true); case "/status":  return status(chat); case "/last_trade": return lastTrade(chat); case "/set_risk": return setRisk(chat,arg); case "/set_filter": return toggleFilter(chat,arg); default: sendTG(chat,"❓ Unknown command. /help"); } }
 
-// 3)  HELPERS
-async function sendTelegram(chat_id, text, extra = {}) {
-  await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`, {
-    method : "POST",
-    headers: { "Content-Type": "application/json" },
-    body   : JSON.stringify({ chat_id, text, ...extra })
-  });
+// ── Command bodies ────────────────────────────────────────── function help(id){ sendTG(id, *B.A.Y.N.E.X Commands* /start – boot /balance – Deriv balance /start_trade – begin auto trading /stop – halt trading /profit – session P/L /status – bot status /last_trade – last trade info /set_risk <maxLoss> <maxTrades> /set_filter on|off,true); }
+
+function status(id){ sendTG(id, Status: *${autoTrading?"Trading":"Idle"}* Trades: ${sessionTrades}/${MAX_TRADES} Profit: ${sessionProfit.toFixed(2)} USD Risk filter: ${FILTER_ENABLED?"ON":"OFF"},true); }
+
+function lastTrade(id){ if(!lastTradeInfo) return sendTG(id,"No trade taken yet."); const {type, entry, exit, profit} = lastTradeInfo; sendTG(id, Last trade Type: ${type} In: ${entry} Out: ${exit} P/L: ${profit.toFixed(2)} USD,false); }
+
+function setRisk(id,arg){ if(arg.length<2) return sendTG(id,"Usage: /set_risk <maxLoss> <maxTrades>"); MAX_SESSION_LOSS = Number(arg[0]); MAX_TRADES = Number(arg[1]); sendTG(id,Risk set → Max loss ${MAX_SESSION_LOSS} USD, Max trades ${MAX_TRADES}); } function toggleFilter(id,arg){ if(!arg[0]||!/(on|off)/i.test(arg[0])) return sendTG(id,"Usage: /set_filter on|off"); FILTER_ENABLED = arg[0].toLowerCase()==="on"; sendTG(id,Strategy filter is now *${FILTER_ENABLED?"ON":"OFF"}*,true); }
+
+async function balance(chat){ try{ const bal = await derivRequest({balance:1, account:"current"}); sendTG(chat,💵 Balance: *${bal.balance} ${bal.currency}*,true); }catch(e){ sendTG(chat,❌ ${e}); } }
+
+// ── Auto Trader Core ──────────────────────────────────────── function startTrader(chat){ const ws = derivSocket(); let authorized=false;
+
+ws.onmessage = async (ev)=>{ const d = JSON.parse(ev.data); if(d.msg_type==="authorize"){ authorized=true; ws.send(JSON.stringify({ticks:"R_100"})); return; } if(d.msg_type==="tick" && authorized && autoTrading){ const price = Number(d.tick.quote); const {ema,rsi}=updateIndicators(price); const now = Date.now();
+
+// apply filter only if enough data
+  let shouldTrade=false; let contract_type="CALL";
+  if(!ema||!rsi) return;
+  if(FILTER_ENABLED){
+    if(price>ema && rsi<70){ shouldTrade=true; contract_type="CALL"; }
+    if(price<ema && rsi>30){ shouldTrade=true; contract_type="PUT";  }
+  }else shouldTrade=true; // filter off = trade every tick!
+
+  if(!shouldTrade) return;
+  if(now - lastTradeTime < 5000) return;              // cooldown
+  if(sessionTrades>=MAX_TRADES) {autoTrading=false; return sendTG(chat,"🚫 Max trades hit. Auto‑trading halted.");}
+  if(sessionProfit<=MAX_SESSION_LOSS) {autoTrading=false; return sendTG(chat,"🚫 Max loss hit. Trading halted.");}
+  if(sessionProfit>=PROFIT_TARGET){autoTrading=false; return sendTG(chat,"🎉 Profit target reached!");}
+
+  // place trade
+  lastTradeTime=now; sessionTrades++;
+  try{
+    const order = await derivRequest({
+      buy:1,
+      price:1,
+      parameters:{
+        amount:1,
+        basis:"stake",
+        contract_type:contract_type,
+        currency:"USD",
+        duration:1,
+        duration_unit:"t",
+        symbol:"R_100"
+      }
+    });
+    const entry=order.buy_price;
+    const profit=order.balance_after - order.balance_before;
+    sessionProfit+=profit;
+    lastTradeInfo={type:contract_type,entry,exit:entry+profit,profit};
+    sendTG(chat,`✅ ${contract_type} trade result: ${profit.toFixed(2)} USD \nSession: ${sessionProfit.toFixed(2)} USD`);
+  }catch(e){ sendTG(chat,`❌ Trade error: ${e}`);}    
 }
 
-function getDerivBalance(chat_id, attempt = 0) {
-  // Two endpoints – primary + fallback
-  const ENDPOINTS = [
-    `wss://ws.deriv.com/websockets/v3?app_id=${APP_ID}`,
-    `wss://ws.binaryws.com/websockets/v3?app_id=${APP_ID}`
-  ];
-  const ws = new WebSocket(ENDPOINTS[attempt]);
+};
 
-  ws.onopen = () => ws.send(JSON.stringify({ authorize: DERIV_TOKEN }));
+ws.onerror=()=>{ sendTG(chat,"❌ Deriv socket error. Reconnecting…"); if(autoTrading) setTimeout(()=>startTrader(chat),5000); }; ws.onclose=()=>{ if(autoTrading) setTimeout(()=>startTrader(chat),5000); }; }
 
-  ws.onmessage = async (ev) => {
-    const d = JSON.parse(ev.data);
-    if (d.msg_type === "authorize") {
-      ws.send(JSON.stringify({ balance: 1, account: "current" }));
-    } else if (d.msg_type === "balance") {
-      await sendTelegram(chat_id, `💰 Your Deriv balance is: ${d.balance.balance} ${d.balance.currency}`);
-      ws.close();
-    } else if (d.error) {
-      await sendTelegram(chat_id, `❌ Deriv error: ${d.error.message}`);
-      ws.close();
-    }
-  };
+// ── Low‑level Deriv helpers ───────────────────────────────── function derivSocket(){ return new WebSocket(wss://ws.binaryws.com/websockets/v3?app_id=${APP_ID}); } function derivRequest(payload){ return new Promise((res,rej)=>{ const ws=derivSocket(); ws.onopen=()=>{ ws.send(JSON.stringify({authorize: DERIV_TOKEN})); }; let authorized=false; ws.onmessage=(ev)=>{ const d=JSON.parse(ev.data); if(d.error){ws.close(); return rej(d.error.message);} if(d.msg_type==="authorize"){ authorized=true; ws.send(JSON.stringify(payload)); return; } if(authorized && d.msg_type!=="authorize"){ ws.close(); return res(d); } }; ws.onerror=e=>{rej(e.message);}
+}); }
 
-  ws.onerror = async (err) => {
-    await sendTelegram(chat_id, `❌ Deriv connection error: ${err.message}`);
-    ws.close();
-  };
-
-  ws.onclose = () => {
-    // Retry once with the fallback endpoint if first try failed
-    if (attempt === 0) getDerivBalance(chat_id, 1);
-  };
-}
-
-// 4)  LAUNCH
-app.listen(PORT, () => console.log(`✅ BAYNEX Webhook live on ${PORT}`));
-
+// ── Telegram helper ───────────────────────────────────────── function sendTG(chat_id,text,markdown=false){ return fetch(https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage,{ method:"POST",headers:{"Content-Type":"application/json"}, body:JSON.stringify({chat_id,text,parse_mode:markdown?"Markdown":undefined})}); }
