@@ -36,28 +36,31 @@ async function sendTelegram(chat_id, text) {
 }
 
 function getDerivBalance(chat_id) {
-  const ws = new WebSocket(`wss://ws.deriv.com/websockets/v3?app_id=${APP_ID}`);
+  const DERIV_WS = `wss://ws.deriv.com/websockets/v3?app_id=${process.env.APP_ID}`;
+  const ws = new WebSocket(DERIV_WS);
+
   ws.onopen = () => {
     ws.send(JSON.stringify({ authorize: DERIV_TOKEN }));
   };
 
   ws.onmessage = async (event) => {
     const data = JSON.parse(event.data);
+
     if (data.msg_type === "authorize") {
-      ws.send(JSON.stringify({ balance: 1 }));
+      ws.send(JSON.stringify({ balance: 1, account: "current" }));
     } else if (data.msg_type === "balance") {
       const balance = data.balance.balance;
       const currency = data.balance.currency;
-      await sendTelegram(chat_id, `Your Deriv balance is: ${balance} ${currency}`);
+      await sendTelegram(chat_id, `✅ Your Deriv balance is: ${balance} ${currency}`);
       ws.close();
     } else if (data.error) {
-      await sendTelegram(chat_id, `Error: ${data.error.message}`);
+      await sendTelegram(chat_id, `❌ Error: ${data.error.message}`);
       ws.close();
     }
   };
 
-  ws.onerror = async () => {
-    await sendTelegram(chat_id, "Error: Could not connect to Deriv.");
+  ws.onerror = async (err) => {
+    await sendTelegram(chat_id, `❌ Deriv connection error: ${err.message}`);
   };
 }
 
