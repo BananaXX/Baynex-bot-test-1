@@ -1,140 +1,66 @@
-/**
- * BAYNEX Telegram – Deriv helper bot
- * ----------------------------------
- *  ✅ Webhook mode (Express)
- *  ✅ /start and /help
- *  ✅ /balance  – shows authorised Deriv balance
- *  ✅ Minimal console logging for easy debugging
- */
+// index.js const express = require("express"); const fetch = require("node-fetch"); const WebSocket = require("ws"); require("dotenv").config();
 
-const express  = require("express");
-const fetch    = require("node-fetch");
-const WebSocket = require("ws");
-require("dotenv").config();
+const app = express(); app.use(express.json());
 
-const app = express();
-app.use(express.json());
+const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN; const DERIV_TOKEN = process.env.DERIV_TOKEN; const APP_ID = process.env.APP_ID; const PORT = process.env.PORT || 10000;
 
-// 🔑 ENV VARS -------------------------------------------------
-const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
-const DERIV_TOKEN    = process.env.DERIV_TOKEN;
-const APP_ID         = process.env.APP_ID;              // Deriv App-ID
-const PORT           = process.env.PORT || 10000;       // Render sees the port we listen on
+// ── Telegram Webhook Setup ── fetch(https://api.telegram.org/bot${TELEGRAM_TOKEN}/setWebhook, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ url: https://${process.env.RENDER_EXTERNAL_HOSTNAME}/webhook }) }) .then(res => res.json()) .then(data => console.log("Webhook set:", data)) .catch(err => console.error("Webhook error:", err));
 
-// 🔧 tiny helper so every log line is time-stamped
-const log = (...args) => console.log(new Date().toISOString(), ...args);
+// ── Telegram Handler ── app.post("/webhook", async (req, res) => { const chat = req.body.message?.chat?.id; const msg = req.body.message?.text || ""; const [cmd, ...args] = msg.trim().split(" ");
 
-// ────────────────────────────────────────────────────────────
-// 1)  Ensure Telegram webhook is set (runs once at boot)
-// ────────────────────────────────────────────────────────────
-(async () => {
-  try {
-    const hookURL = `https://${process.env.RENDER_EXTERNAL_HOSTNAME}/webhook`;
-    const res     = await fetch(
-      `https://api.telegram.org/bot${TELEGRAM_TOKEN}/setWebhook`,
-      {
-        method : "POST",
-        headers: { "Content-Type": "application/json" },
-        body   : JSON.stringify({ url: hookURL })
-      }
-    );
-    log("Telegram webhook set:", await res.json());
-  } catch (e) {
-    log("❌ Error setting webhook", e);
+log("Telegram →", msg);
+
+switch (cmd) { case "/start": return sendTG(chat, "🤖 B.A.Y.N.E.X online. Type /help."); case "/help": return sendTG(chat, B.A.Y.N.E.X Commands\n/start – boot\n/balance – Deriv balance); case "/balance": sendTG(chat, "📡 Fetching your Deriv balance..."); return getDerivBalance(chat); default: return sendTG(chat, "❓ Unknown command. /help"); } });
+
+// ── Telegram Send Wrapper ── async function sendTG(chat, text) { if (!chat) return; log("Telegram ←", text); await fetch(https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ chat_id: chat, text }) }); }
+
+// ── Balance Handler with Host Fallback ── function getDerivBalance(chat) { const HOSTS = [ wss://ws.deriv.com/websockets/v3?app_id=${APP_ID}, wss://ws.binaryws.com/websockets/v3?app_id=${APP_ID}, wss://green.binaryws.com/websockets/v3?app_id=${APP_ID} ];
+
+let attempt = 0; connectNextHost();
+
+function connectNextHost() { if (attempt >= HOSTS.length) { sendTG(chat, "❌ All Deriv endpoints unreachable."); log("All hosts failed"); return; }
+
+const url = HOSTS[attempt++];
+log("WS connect →", url);
+
+const ws = new WebSocket(url);
+
+ws.onopen = () => {
+  log("WS open, authorised with", url);
+  ws.send(JSON.stringify({ authorize: DERIV_TOKEN }));
+};
+
+ws.onmessage = async (evt) => {
+  const data = JSON.parse(evt.data);
+  log("WS msg_type:", data.msg_type, "via", url);
+
+  if (data.msg_type === "authorize") {
+    ws.send(JSON.stringify({ balance: 1, account: "current" }));
+  } else if (data.msg_type === "balance") {
+    const { balance, currency } = data.balance;
+    await sendTG(chat, `💰 Balance: ${balance} ${currency}`);
+    ws.close();
+  } else if (data.error) {
+    await sendTG(chat, `⚠️ Deriv error: ${data.error.message}`);
+    ws.close();
   }
-})();
+};
 
-// ────────────────────────────────────────────────────────────
-// 2)  Handle ALL Telegram updates here
-// ────────────────────────────────────────────────────────────
-app.post("/webhook", async (req, res) => {
-  const chat = req.body.message?.chat?.id;
-  const text = (req.body.message?.text || "").trim();
-  const [cmd, ...args] = text.split(/\s+/);
+ws.onerror = (err) => {
+  log("WS error on", url, err.message);
+  ws.close();
+};
 
-  log("← Telegram", { cmd, args });
-
-  switch (cmd.toLowerCase()) {
-    case "/start":
-      await sendTG(chat, "🤖 B.A.Y.N.E.X online. Type /help.");
-      break;
-
-    case "/help":
-      await sendTG(
-        chat,
-        `B.A.Y.N.E.X Commands
-/start – boot
-/balance – Deriv balance`
-      );
-      break;
-
-    case "/balance":
-      await sendTG(chat, "📡 Fetching your Deriv balance…");
-      getDerivBalance(chat);
-      break;
-
-    default:
-      await sendTG(chat, "❓ Unknown command. /help");
+ws.onclose = () => {
+  if (!ws._balanceDelivered) {
+    log("Trying next host...");
+    connectNextHost();
   }
+};
 
-  res.sendStatus(200);
-});
+} }
 
-// ────────────────────────────────────────────────────────────
-// 3)  Telegram send helper
-// ────────────────────────────────────────────────────────────
-async function sendTG(chat_id, text) {
-  try {
-    await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`, {
-      method : "POST",
-      headers: { "Content-Type": "application/json" },
-      body   : JSON.stringify({ chat_id, text })
-    });
-    log("→ Telegram", text.replace(/\n/g, " "));
-  } catch (e) {
-    log("❌ sendTG error", e);
-  }
-}
+// ── Logger ── function log(...args) { console.log(new Date().toISOString(), ...args); }
 
-// ────────────────────────────────────────────────────────────
-// 4)  Deriv balance helper
-// ────────────────────────────────────────────────────────────
-function getDerivBalance(chat) {
-  const ws = new WebSocket(
-    `wss://ws.deriv.com/websockets/v3?app_id=${APP_ID}`
-  );
+// ── Start Server ── app.listen(PORT, () => { log(✅ BAYNEX Webhook live on ${PORT}); });
 
-  ws.onopen = () => {
-    log("WS open → authorising");
-    ws.send(JSON.stringify({ authorize: DERIV_TOKEN }));
-  };
-
-  ws.onmessage = async (event) => {
-    const data = JSON.parse(event.data);
-    log("WS msg_type:", data.msg_type);
-
-    if (data.msg_type === "authorize") {
-      ws.send(JSON.stringify({ balance: 1, account: "current" }));
-    } else if (data.msg_type === "balance") {
-      const bal  = data.balance.balance;
-      const curr = data.balance.currency;
-      await sendTG(chat, `💰 Balance: ${bal} ${curr}`);
-      ws.close();
-    } else if (data.error) {
-      await sendTG(chat, `⚠️ Deriv error: ${data.error.message}`);
-      ws.close();
-    }
-  };
-
-  ws.onerror = async (err) => {
-    log("WS error", err.message);
-    await sendTG(chat, `❌ Deriv connection error: ${err.message}`);
-  };
-}
-
-// ────────────────────────────────────────────────────────────
-// 5)  Start server
-// ────────────────────────────────────────────────────────────
-app.listen(PORT, () => {
-  log(`🚀 BAYNEX listening on ${PORT}`);
-});
