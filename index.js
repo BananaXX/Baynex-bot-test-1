@@ -63,4 +63,4 @@ function getDerivBalance(chat_id) {
 
 app.listen(PORT, () => {
   console.log(`BAYNEX is live on port ${PORT}`);
-});￼Enter
+  });
